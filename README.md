@@ -1,7 +1,7 @@
 # 3D Pin Art Visualizer
 
-A real-time audio visualizer rendered as a colorful reactive 3D pin art lattice, 
-built with React and Three.js.
+A real-time audio visualizer rendered as a colorful reactive 3D pin art 
+lattice, built with React and Three.js.
 
 ![Pin Art Visualizer Demo](./screenshot.png)
 
@@ -10,6 +10,8 @@ built with React and Three.js.
 - 🎵 **Tab Audio** — capture audio from any browser tab
 - 🎤 **Microphone** — react to live mic input
 - 📁 **Audio File** — upload and visualize any MP3
+- 🌊 **Wave & Ripple Dynamics** — fluid, organic movement patterns 
+  layered over the pin lattice
 
 ## Run Locally
 
