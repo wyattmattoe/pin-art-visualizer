@@ -1,5 +1,7 @@
 # 3D Pin Art Visualizer
 
+**[Live Demo]([https://your-netlify-url.netlify.app](https://pin-art-visualizer-v1-1-demo.netlify.app/))**
+
 A real-time audio visualizer rendered as a colorful reactive 3D pin art 
 lattice, built with React and Three.js.
 
