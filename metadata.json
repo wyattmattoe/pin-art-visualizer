@@ -1,0 +1,6 @@
+{
+  "name": "3D Pin Art Visualizer",
+  "description": "A 3D reactive pin art audio visualizer built with Three.js and React.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

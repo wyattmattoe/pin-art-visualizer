@@ -1,0 +1,122 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+  margin: 0;
+  background: #050505;
+}
+
+.crt-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 40;
+  background:
+    linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), 
+    linear-gradient(90deg, rgba(255, 0, 0, 0.06), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.06));
+  background-size: 100% 4px, 3px 100%;
+  box-shadow: inset 0 0 150px rgba(0,0,0,0.9);
+  animation: crt-flicker 0.15s infinite;
+}
+
+.audio-progress {
+  --progress: 0%;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+  height: 24px;
+}
+
+.audio-progress:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.85);
+  outline-offset: 4px;
+}
+
+.audio-progress::-webkit-slider-runnable-track {
+  background: linear-gradient(to right, #ffffff var(--progress), rgba(255, 255, 255, 0.2) var(--progress));
+  border-radius: 999px;
+  height: 6px;
+}
+
+.audio-progress::-webkit-slider-thumb {
+  appearance: none;
+  background: #ffffff;
+  border: 0;
+  border-radius: 50%;
+  box-shadow: 0 0 14px rgba(255, 255, 255, 0.5);
+  height: 16px;
+  margin-top: -5px;
+  width: 16px;
+}
+
+.audio-progress::-moz-range-track {
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 999px;
+  height: 6px;
+}
+
+.audio-progress::-moz-range-progress {
+  background: #ffffff;
+  border-radius: 999px;
+  height: 6px;
+}
+
+.audio-progress::-moz-range-thumb {
+  background: #ffffff;
+  border: 0;
+  border-radius: 50%;
+  box-shadow: 0 0 14px rgba(255, 255, 255, 0.5);
+  height: 16px;
+  width: 16px;
+}
+
+.playback-icon {
+  color: currentColor;
+  display: block;
+}
+
+.playback-icon-play {
+  border-bottom: 6px solid transparent;
+  border-left: 10px solid currentColor;
+  border-top: 6px solid transparent;
+  height: 0;
+  margin-left: 2px;
+  width: 0;
+}
+
+.playback-icon-pause {
+  display: flex;
+  gap: 3px;
+}
+
+.playback-icon-pause::before,
+.playback-icon-pause::after {
+  background: currentColor;
+  border-radius: 1px;
+  content: "";
+  display: block;
+  height: 12px;
+  width: 3px;
+}
+
+@keyframes crt-flicker {
+  0% { opacity: 0.95; }
+  5% { opacity: 0.85; }
+  10% { opacity: 0.95; }
+  15% { opacity: 1; }
+  50% { opacity: 0.95; }
+  100% { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .crt-overlay {
+    animation: none;
+  }
+}
