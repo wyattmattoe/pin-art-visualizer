@@ -7,6 +7,9 @@ lattice, built with React and Three.js.
 
 ![Pin Art Visualizer Demo](./screenshot.png)
 
+https://github.com/user-attachments/assets/99d0ed01-2b53-484f-a465-1a2d98079c3b
+
+
 ## Features
 
 - 🎵 **Tab Audio** — capture audio from any browser tab
