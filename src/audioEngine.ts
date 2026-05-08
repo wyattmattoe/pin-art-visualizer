@@ -1,6 +1,6 @@
 /**
  * @license
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: MIT
  */
 
 export type AudioFrame = {
@@ -12,6 +12,13 @@ export type AudioFrame = {
   volume: number;
   beat: boolean;
   beatEnergy: number;
+  snareOnset: boolean;
+  snareEnergy: number;
+  hatOnset: boolean;
+  hatEnergy: number;
+  spectralFlux: number;
+  spectralCentroid: number;
+  rmsEnergy: number;
   spectrum: Float32Array;
   waveform: Float32Array;
 };
@@ -60,11 +67,17 @@ type ChromeDisplayMediaOptions = DisplayMediaStreamOptions & {
 };
 
 const MIN_BEAT_INTERVAL_MS = 220;
+const MIN_SNARE_INTERVAL_MS = 95;
+const MIN_HAT_INTERVAL_MS = 55;
+const SNARE_FLUX_THRESHOLD = 0.045;
+const HAT_FLUX_THRESHOLD = 0.022;
 
+// Clamp a value between 0 and 1
 function clamp01(value: number) {
   return Math.min(1, Math.max(0, value));
 }
 
+// Create a new audio frame with default values
 function createMutableFrame(): AudioFrame {
   return {
     bass: 0,
@@ -75,11 +88,19 @@ function createMutableFrame(): AudioFrame {
     volume: 0,
     beat: false,
     beatEnergy: 0,
+    snareOnset: false,
+    snareEnergy: 0,
+    hatOnset: false,
+    hatEnergy: 0,
+    spectralFlux: 0,
+    spectralCentroid: 0,
+    rmsEnergy: 0,
     spectrum: new Float32Array(SPECTRUM_BAND_COUNT),
     waveform: new Float32Array(WAVEFORM_POINT_COUNT),
   };
 }
 
+// Get the AudioContext constructor with webkit fallback for Safari
 function getAudioContextConstructor() {
   const AudioContextClass = window.AudioContext ?? (window as BrowserWithLegacyAudioContext).webkitAudioContext;
 
@@ -90,6 +111,7 @@ function getAudioContextConstructor() {
   return AudioContextClass;
 }
 
+// Average frequency data over a given Hz range and return normalized value
 function averageFrequencyRange(
   frequencyData: Uint8Array,
   sampleRate: number,
@@ -113,6 +135,7 @@ function averageFrequencyRange(
   return clamp01(sum / ((endIndex - startIndex + 1) * 255));
 }
 
+// Create a provider that returns silent audio frames
 export function createSilentAudioProvider(): AudioFrameProvider {
   const frame = createMutableFrame();
 
@@ -129,8 +152,24 @@ class WebAudioFrameProvider implements AudioFrameProvider {
   private readonly source: AudioNode;
   private lastBeatTime = 0;
   private smoothedBass = 0;
-  private smoothedVolume = 0;
+  private peakBass = 0;
+  private peakLowMid = 0;
+  private peakMid = 0;
+  private peakHighMid = 0;
+  private peakTreble = 0;
+  private previousBass = 0;
+  private previousLowMid = 0;
+  private previousMid = 0;
+  private previousHighMid = 0;
+  private previousTreble = 0;
+  private smoothedSnareFlux = 0;
+  private smoothedHatFlux = 0;
+  private lastSnareTime = 0;
+  private lastHatTime = 0;
+  private energyHistory: number[] = [];
+  private readonly ENERGY_HISTORY_SIZE = 43;
 
+  // Initialize the audio provider with context, analyser, source, and cleanup function
   constructor(
     private readonly audioContext: AudioContext,
     private readonly analyser: AnalyserNode,
@@ -142,6 +181,7 @@ class WebAudioFrameProvider implements AudioFrameProvider {
     this.timeData = new Uint8Array(analyser.fftSize);
   }
 
+  // Analyze current audio data and return the processed frame
   getFrame(time: number) {
     this.analyser.getByteFrequencyData(this.frequencyData);
     this.analyser.getByteTimeDomainData(this.timeData);
@@ -153,18 +193,21 @@ class WebAudioFrameProvider implements AudioFrameProvider {
     this.frame.mid = averageFrequencyRange(this.frequencyData, sampleRate, 420, 1800);
     this.frame.highMid = averageFrequencyRange(this.frequencyData, sampleRate, 1800, 5200);
     this.frame.treble = averageFrequencyRange(this.frequencyData, sampleRate, 5200, 14000);
-    this.frame.volume = clamp01(
-      this.frame.bass * 0.34 +
-        this.frame.lowMid * 0.2 +
-        this.frame.mid * 0.2 +
-        this.frame.highMid * 0.12 +
-        this.frame.treble * 0.14,
-    );
 
+    // Update energy history for adaptive beat detection
+    this.energyHistory.push(this.frame.bass);
+    if (this.energyHistory.length > this.ENERGY_HISTORY_SIZE) {
+      this.energyHistory.shift();
+    }
+    const avgEnergy = this.energyHistory.length > 0 
+      ? this.energyHistory.reduce((sum, val) => sum + val, 0) / this.energyHistory.length 
+      : 0;
+
+    // Exponential smoothing for bass
     this.smoothedBass = this.smoothedBass * 0.9 + this.frame.bass * 0.1;
-    this.smoothedVolume = this.smoothedVolume * 0.93 + this.frame.volume * 0.07;
 
-    const beatThreshold = Math.max(0.18, this.smoothedBass * 1.45 + this.smoothedVolume * 0.22);
+    // Detect beat: bass must exceed adaptive threshold and respect minimum interval
+    const beatThreshold = avgEnergy * 1.5;
     this.frame.beat = this.frame.bass > beatThreshold && time - this.lastBeatTime > MIN_BEAT_INTERVAL_MS;
     this.frame.beatEnergy = this.frame.beat
       ? clamp01(this.frame.bass + this.frame.volume * 0.35)
@@ -174,6 +217,117 @@ class WebAudioFrameProvider implements AudioFrameProvider {
       this.lastBeatTime = time;
     }
 
+    // Per-band spectral flux: positive frame-to-frame change in raw band energy.
+    // Drives separate onset detectors so snare hits and hi-hat sizzles get their
+    // own visual triggers instead of being summed into the bass-only beat.
+    const rawBass = this.frame.bass;
+    const rawLowMid = this.frame.lowMid;
+    const rawMid = this.frame.mid;
+    const rawHighMid = this.frame.highMid;
+    const rawTreble = this.frame.treble;
+    const snareFlux = Math.max(0, rawLowMid - this.previousLowMid);
+    const hatFlux = Math.max(
+      0,
+      (rawHighMid + rawTreble) * 0.5 - (this.previousHighMid + this.previousTreble) * 0.5,
+    );
+    this.smoothedSnareFlux = this.smoothedSnareFlux * 0.86 + snareFlux * 0.14;
+    this.smoothedHatFlux = this.smoothedHatFlux * 0.82 + hatFlux * 0.18;
+
+    this.frame.snareOnset =
+      snareFlux > SNARE_FLUX_THRESHOLD &&
+      snareFlux > this.smoothedSnareFlux * 1.65 &&
+      time - this.lastSnareTime > MIN_SNARE_INTERVAL_MS;
+
+    if (this.frame.snareOnset) {
+      this.lastSnareTime = time;
+      this.frame.snareEnergy = clamp01(snareFlux * 5 + rawLowMid * 0.4);
+    } else {
+      this.frame.snareEnergy = Math.max(0, this.frame.snareEnergy * 0.84 - 0.01);
+    }
+
+    this.frame.hatOnset =
+      hatFlux > HAT_FLUX_THRESHOLD &&
+      hatFlux > this.smoothedHatFlux * 1.55 &&
+      time - this.lastHatTime > MIN_HAT_INTERVAL_MS;
+
+    if (this.frame.hatOnset) {
+      this.lastHatTime = time;
+      this.frame.hatEnergy = clamp01(hatFlux * 6 + rawTreble * 0.32);
+    } else {
+      this.frame.hatEnergy = Math.max(0, this.frame.hatEnergy * 0.78 - 0.012);
+    }
+
+    this.frame.spectralFlux = clamp01(
+      Math.max(0, rawBass - this.previousBass) +
+        snareFlux +
+        Math.max(0, rawMid - this.previousMid) +
+        Math.max(0, rawHighMid - this.previousHighMid) +
+        Math.max(0, rawTreble - this.previousTreble),
+    );
+
+    this.previousBass = rawBass;
+    this.previousLowMid = rawLowMid;
+    this.previousMid = rawMid;
+    this.previousHighMid = rawHighMid;
+    this.previousTreble = rawTreble;
+
+    // Peaking ballistics: instant attack, slow release for visual persistence
+    const release = 0.92;
+    this.peakBass = this.frame.bass > this.peakBass ? this.frame.bass : Math.max(this.frame.bass, this.peakBass * release);
+    this.peakLowMid = this.frame.lowMid > this.peakLowMid ? this.frame.lowMid : Math.max(this.frame.lowMid, this.peakLowMid * release);
+    this.peakMid = this.frame.mid > this.peakMid ? this.frame.mid : Math.max(this.frame.mid, this.peakMid * release);
+    this.peakHighMid = this.frame.highMid > this.peakHighMid ? this.frame.highMid : Math.max(this.frame.highMid, this.peakHighMid * release);
+    this.peakTreble = this.frame.treble > this.peakTreble ? this.frame.treble : Math.max(this.frame.treble, this.peakTreble * release);
+
+    this.frame.bass = this.peakBass;
+    this.frame.lowMid = this.peakLowMid;
+    this.frame.mid = this.peakMid;
+    this.frame.highMid = this.peakHighMid;
+    this.frame.treble = this.peakTreble;
+    this.frame.volume = clamp01(
+      this.peakBass * 0.34 + this.peakLowMid * 0.2 + this.peakMid * 0.2 +
+      this.peakHighMid * 0.12 + this.peakTreble * 0.14,
+    );
+
+    // Silence decay: when volume is very low, fade out frequency bands
+    if (this.frame.volume < 0.01) {
+      this.peakBass *= 0.95;
+      this.peakLowMid *= 0.95;
+      this.peakMid *= 0.95;
+      this.peakHighMid *= 0.95;
+      this.peakTreble *= 0.95;
+      this.frame.bass = this.peakBass;
+      this.frame.lowMid = this.peakLowMid;
+      this.frame.mid = this.peakMid;
+      this.frame.highMid = this.peakHighMid;
+      this.frame.treble = this.peakTreble;
+      this.frame.volume = clamp01(
+        this.peakBass * 0.34 + this.peakLowMid * 0.2 + this.peakMid * 0.2 +
+        this.peakHighMid * 0.12 + this.peakTreble * 0.14,
+      );
+    }
+
+    // Spectral centroid: center of gravity of the frequency spectrum (perceived brightness)
+    let centroidNum = 0;
+    let centroidDen = 0;
+    const nyquist = sampleRate / 2;
+    for (let index = 0; index < this.frequencyData.length; index += 1) {
+      const mag = this.frequencyData[index];
+      const freq = (index / this.frequencyData.length) * nyquist;
+      centroidNum += freq * mag;
+      centroidDen += mag;
+    }
+    this.frame.spectralCentroid = centroidDen > 0 ? clamp01((centroidNum / centroidDen) / nyquist) : 0;
+
+    // RMS energy: true loudness from time-domain data
+    let rmsSum = 0;
+    for (let index = 0; index < this.timeData.length; index += 1) {
+      const sample = (this.timeData[index] - 128) / 128;
+      rmsSum += sample * sample;
+    }
+    this.frame.rmsEnergy = clamp01(Math.sqrt(rmsSum / this.timeData.length) * 3.2);
+
+    // Fill spectrum array by averaging frequency bins into bands
     for (let index = 0; index < SPECTRUM_BAND_COUNT; index += 1) {
       const start = Math.floor((index / SPECTRUM_BAND_COUNT) * this.frequencyData.length);
       const end = Math.max(start + 1, Math.floor(((index + 1) / SPECTRUM_BAND_COUNT) * this.frequencyData.length));
@@ -186,6 +340,7 @@ class WebAudioFrameProvider implements AudioFrameProvider {
       this.frame.spectrum[index] = clamp01(sum / ((end - start) * 255));
     }
 
+    // Sample waveform at evenly spaced intervals
     for (let index = 0; index < WAVEFORM_POINT_COUNT; index += 1) {
       const timeIndex = Math.floor((index / WAVEFORM_POINT_COUNT) * this.timeData.length);
       this.frame.waveform[index] = (this.timeData[timeIndex] - 128) / 128;
@@ -194,6 +349,7 @@ class WebAudioFrameProvider implements AudioFrameProvider {
     return this.frame;
   }
 
+  // Clean up audio nodes and close resources
   dispose() {
     this.source.disconnect();
     this.analyser.disconnect();
@@ -201,6 +357,7 @@ class WebAudioFrameProvider implements AudioFrameProvider {
   }
 }
 
+// Create and configure an analyser node with preset values
 function createAnalyser(audioContext: AudioContext) {
   const analyser = audioContext.createAnalyser();
   analyser.fftSize = 2048;
@@ -211,6 +368,7 @@ function createAnalyser(audioContext: AudioContext) {
   return analyser;
 }
 
+// Create an audio provider that captures from the microphone
 export async function createMicrophoneAudioProvider() {
   if (!navigator.mediaDevices?.getUserMedia) {
     throw new Error('Microphone input is not supported in this browser.');
@@ -245,6 +403,7 @@ export async function createMicrophoneAudioProvider() {
   });
 }
 
+// Create an audio provider that captures audio from a browser tab
 export async function createBrowserTabAudioProvider(onEnded?: () => void) {
   if (!navigator.mediaDevices?.getDisplayMedia) {
     throw new Error('Browser tab audio capture is not supported in this browser.');
@@ -314,6 +473,7 @@ export async function createBrowserTabAudioProvider(onEnded?: () => void) {
   });
 }
 
+// Create an audio provider that plays from a file
 export async function createFileAudioProvider(file: File): Promise<FileAudioFrameProvider> {
   const AudioContextClass = getAudioContextConstructor();
   const audioContext = new AudioContextClass();

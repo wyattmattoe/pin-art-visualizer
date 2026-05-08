@@ -1,6 +1,6 @@
 /**
  * @license
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: MIT
  */
 
 import * as THREE from 'three';
@@ -8,7 +8,6 @@ import {AfterimagePass} from 'three/examples/jsm/postprocessing/AfterimagePass.j
 import {EffectComposer} from 'three/examples/jsm/postprocessing/EffectComposer.js';
 import {RenderPass} from 'three/examples/jsm/postprocessing/RenderPass.js';
 import {ShaderPass} from 'three/examples/jsm/postprocessing/ShaderPass.js';
-import {UnrealBloomPass} from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import {RGBShiftShader} from 'three/examples/jsm/shaders/RGBShiftShader.js';
 import type {AudioFrame} from './audioEngine';
 import {SPECTRUM_BAND_COUNT, WAVEFORM_POINT_COUNT, createSilentAudioProvider} from './audioEngine';
@@ -17,14 +16,54 @@ type SceneController = {
   dispose: () => void;
 };
 
+export type VisualizerShape = 'sphere' | 'cube' | 'tetrahedron' | 'mobius' | 'doubleHelix' | 'human' | 'wall';
+
 type PinVisualizerSceneOptions = {
   getAudioFrame?: (time: number) => AudioFrame;
+  getZoom?: () => number;
+  getShape?: () => VisualizerShape;
+  getColorIntensity?: () => number;
+  getColorShift?: () => number;
+  getSolidColorEnabled?: () => boolean;
+  getSolidColor?: () => number;
+  getPinHeight?: () => number;
+  getPinSize?: () => number;
+  getOrbitEnabled?: () => boolean;
   onReady?: () => void;
+};
+
+type PinSurface = {
+  baseX: number;
+  baseY: number;
+  baseZ: number;
+  normalX: number;
+  normalY: number;
+  normalZ: number;
+  longitude: number;
+  latitude: number;
+  orientation: THREE.Quaternion;
 };
 
 type PinState = {
   x: number;
   y: number;
+  baseX: number;
+  baseY: number;
+  baseZ: number;
+  normalX: number;
+  normalY: number;
+  normalZ: number;
+  longitude: number;
+  latitude: number;
+  orientation: THREE.Quaternion;
+  surfaces: Record<VisualizerShape, PinSurface>;
+  bassAffinity: number;
+  lowMidAffinity: number;
+  midAffinity: number;
+  highMidAffinity: number;
+  trebleAffinity: number;
+  beatAffinity: number;
+  resonancePhase: number;
   centerDistance: number;
   normalizedX: number;
   normalizedY: number;
@@ -73,12 +112,26 @@ const PIN_ROWS = 76;
 const PIN_COUNT = PIN_COLUMNS * PIN_ROWS;
 const PIN_SPACING = 0.82;
 const PIN_RADIUS = 0.15;
+const PIN_HEAD_RADIUS = 0.34;
 const PIN_LENGTH = 10;
+const PIN_HEAD_OFFSET = PIN_LENGTH + PIN_HEAD_RADIUS * 0.3;
 const PIN_HOME_Z = -15;
-const PIN_ROTATION_X = Math.PI / 2;
 const FIELD_HALF_WIDTH = ((PIN_COLUMNS - 1) * PIN_SPACING) / 2;
 const FIELD_HALF_HEIGHT = ((PIN_ROWS - 1) * PIN_SPACING) / 2;
 const FIELD_RADIUS = Math.sqrt(FIELD_HALF_WIDTH * FIELD_HALF_WIDTH + FIELD_HALF_HEIGHT * FIELD_HALF_HEIGHT);
+const PIN_SPHERE_RADIUS = FIELD_HALF_HEIGHT * 1.05;
+const PIN_SPHERE_RESPONSE_SCALE = 0.82;
+const CAMERA_DEFAULT_Z = PIN_SPHERE_RADIUS * 4.75;
+const CAMERA_FRAME_RADIUS = PIN_SPHERE_RADIUS + PIN_LENGTH * 3.05 + 28;
+const CAMERA_FRAME_MARGIN = 1.18;
+const CAMERA_MIN_VISIBLE_HEIGHT_RATIO = 0.66;
+const CAMERA_TARGET_SHIFT = CAMERA_FRAME_RADIUS * 0.08;
+const CAMERA_PORTRAIT_TARGET_SHIFT = CAMERA_FRAME_RADIUS * 0.09;
+const WALL_CAMERA_MARGIN = 1.06;
+const MAX_FOG_DENSITY = 0.0048;
+const PIN_LOCAL_AXIS = new THREE.Vector3(0, 1, 0);
+const ORBIT_LIGHT_DISTANCE = PIN_SPHERE_RADIUS * 1.75;
+const ORBIT_LIGHT_HEIGHT = PIN_SPHERE_RADIUS * 0.72;
 
 const RIPPLE_SPEED = 68;
 const RIPPLE_DURATION_SECONDS = 1.65;
@@ -99,11 +152,14 @@ const SHAPE_EDGE_Y = FIELD_HALF_HEIGHT * 0.78;
 const SHAPE_EDGE_DRIFT = 6.2;
 
 const PROCEDURAL_ELEMENT_COUNT_PER_KIND = 18;
-const PLASMA_FIELD_WIDTH = FIELD_HALF_WIDTH * 2.65;
-const PLASMA_FIELD_HEIGHT = FIELD_HALF_HEIGHT * 2.35;
 
 const SPRING_STIFFNESS = 0.085;
 const SPRING_DAMPING = 0.76;
+// Neighbor coupling strength for the pin field: each pin's spring is perturbed by
+// a discrete Laplacian over its 4 grid neighbors. Audio still drives targetZ for
+// every pin individually, but transients now propagate laterally as ripples
+// through a coupled membrane instead of staying purely local.
+const PIN_COUPLING_K = 0.028;
 const COLOR_LERP_ALPHA = 0.12;
 
 const FIREWORK_PARTICLE_COUNT = 3000;
@@ -112,6 +168,9 @@ const FIREWORK_DRAG_PER_FRAME = 0.95;
 const FIREWORK_FADE_PER_FRAME = 0.94;
 const FIREWORK_LIFE_DRAIN_PER_SECOND = 0.48;
 const HIDDEN_PARTICLE_POSITION = 9999;
+
+const REACTIVE_SHAPES_ENABLED = false;
+const PROCEDURAL_ELEMENTS_ENABLED = false;
 
 const BACKGROUND_COLOR = new THREE.Color(0x080808);
 const BRAND_COLORS = [
@@ -182,84 +241,14 @@ const WaveWarpShader = {
   `,
 };
 
-const PlasmaFieldShader = {
-  uniforms: {
-    time: {value: 0},
-    bass: {value: 0},
-    lowMid: {value: 0},
-    mid: {value: 0},
-    highMid: {value: 0},
-    treble: {value: 0},
-    volume: {value: 0},
-    beat: {value: 0},
-    colorA: {value: new THREE.Color(0x4285f4)},
-    colorB: {value: new THREE.Color(0xea4335)},
-    colorC: {value: new THREE.Color(0xfbbc05)},
-  },
-  vertexShader: `
-    varying vec2 vUv;
-
-    void main() {
-      vUv = uv;
-      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-    }
-  `,
-  fragmentShader: `
-    uniform float time;
-    uniform float bass;
-    uniform float lowMid;
-    uniform float mid;
-    uniform float highMid;
-    uniform float treble;
-    uniform float volume;
-    uniform float beat;
-    uniform vec3 colorA;
-    uniform vec3 colorB;
-    uniform vec3 colorC;
-    varying vec2 vUv;
-
-    float hash(vec2 p) {
-      p = fract(p * vec2(123.34, 456.21));
-      p += dot(p, p + 45.32);
-      return fract(p.x * p.y);
-    }
-
-    float noise(vec2 p) {
-      vec2 i = floor(p);
-      vec2 f = fract(p);
-      float a = hash(i);
-      float b = hash(i + vec2(1.0, 0.0));
-      float c = hash(i + vec2(0.0, 1.0));
-      float d = hash(i + vec2(1.0, 1.0));
-      vec2 u = f * f * (3.0 - 2.0 * f);
-      return mix(a, b, u.x) + (c - a) * u.y * (1.0 - u.x) + (d - b) * u.x * u.y;
-    }
-
-    void main() {
-      vec2 centered = vUv - 0.5;
-      float dist = length(centered);
-      float angle = atan(centered.y, centered.x);
-      vec2 flowUv = centered * (3.0 + lowMid * 2.4);
-      float swirl = sin(angle * (5.0 + highMid * 5.0) + dist * (26.0 + bass * 18.0) - time * (1.1 + treble * 3.8));
-      float cells = noise(flowUv * 3.0 + vec2(time * (0.18 + bass * 0.42), -time * (0.12 + mid * 0.38)));
-      float filaments = sin((vUv.x + cells * 0.18) * 34.0 + time * (1.8 + treble * 5.5)) *
-        cos((vUv.y - cells * 0.16) * 26.0 - time * (1.2 + highMid * 4.0));
-      float edgeEnergy = smoothstep(0.18, 0.78, dist);
-      float coreEnergy = 1.0 - smoothstep(0.04, 0.62, dist);
-      float plasma = smoothstep(0.16, 1.0, cells * 0.62 + filaments * 0.22 + swirl * 0.18 + beat * 0.25);
-      plasma = pow(plasma, 1.28);
-      vec3 color = mix(colorA, colorB, 0.5 + 0.5 * sin(time * 0.34 + plasma * 2.4 + angle));
-      color = mix(color, colorC, 0.32 + 0.35 * sin(dist * 16.0 - time * 0.47 + treble * 2.0));
-      float alpha = (0.026 + volume * 0.16 + beat * 0.18) * plasma;
-      alpha += edgeEnergy * (0.018 + highMid * 0.1 + treble * 0.12 + beat * 0.05);
-      alpha += coreEnergy * bass * 0.05;
-      gl_FragColor = vec4(color * (0.56 + volume * 1.8 + beat * 1.45 + plasma * 0.68), alpha);
-    }
-  `,
-};
-
 function clamp01(value: number) {
   return Math.min(1, Math.max(0, value));
+}
+
+function smoothstep(edge0: number, edge1: number, value: number) {
+  const t = clamp01((value - edge0) / (edge1 - edge0));
+
+  return t * t * (3 - 2 * t);
 }
 
 function getContainerSize(container: HTMLElement) {
@@ -271,8 +260,46 @@ function getContainerSize(container: HTMLElement) {
   };
 }
 
-function setGradientColor(target: THREE.Color, t: number) {
-  const wrappedT = t - Math.floor(t);
+function getResponsiveCameraFrame(width: number, height: number, verticalFovDegrees: number, frameRadius = CAMERA_FRAME_RADIUS) {
+  const aspect = width / height;
+  const verticalFov = THREE.MathUtils.degToRad(verticalFovDegrees);
+  const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * aspect);
+  const portraitT = clamp01((1 - aspect) / 0.72);
+  const usableHeightRatio = Math.max(CAMERA_MIN_VISIBLE_HEIGHT_RATIO, 0.82 - portraitT * 0.12);
+  const verticalDistance = (frameRadius / Math.tan(verticalFov / 2)) / usableHeightRatio;
+  const horizontalDistance = frameRadius / Math.tan(horizontalFov / 2);
+  const distance = Math.max(verticalDistance, horizontalDistance) * CAMERA_FRAME_MARGIN;
+  const targetY = -(CAMERA_TARGET_SHIFT + portraitT * CAMERA_PORTRAIT_TARGET_SHIFT);
+
+  return {distance, targetY};
+}
+
+function getWallCameraFrame(width: number, height: number, verticalFovDegrees: number) {
+  const aspect = width / height;
+  const verticalFov = THREE.MathUtils.degToRad(verticalFovDegrees);
+  const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * aspect);
+  const frameHeight = FIELD_HALF_HEIGHT + PIN_LENGTH * 1.2;
+  const frameWidth = FIELD_HALF_WIDTH + PIN_LENGTH * 1.2;
+  const verticalDist = (frameHeight / Math.tan(verticalFov / 2)) * WALL_CAMERA_MARGIN;
+  const horizontalDist = (frameWidth / Math.tan(horizontalFov / 2)) * WALL_CAMERA_MARGIN;
+  return {distance: Math.max(verticalDist, horizontalDist), targetY: 0};
+}
+
+function getCameraDistance(baseDistance: number, zoom: number) {
+  return baseDistance / Math.max(0.35, zoom);
+}
+
+function setGradientColor(target: THREE.Color, t: number, colorShift = 0, solidColor?: THREE.Color | null) {
+  const shiftedT = t + colorShift;
+  const wrappedT = shiftedT - Math.floor(shiftedT);
+
+  if (solidColor) {
+    const shade = 0.34 + Math.pow(0.5 + 0.5 * Math.sin(wrappedT * Math.PI * 2), 1.15) * 1.28;
+
+    target.copy(solidColor).multiplyScalar(shade);
+    return;
+  }
+
   const scaledT = wrappedT * BRAND_COLORS.length;
   const index = Math.floor(scaledT) % BRAND_COLORS.length;
   const nextIndex = (index + 1) % BRAND_COLORS.length;
@@ -286,7 +313,381 @@ function sampleFloatArray(values: Float32Array, normalizedIndex: number) {
   return values[index] ?? 0;
 }
 
-function createPinStates(pinMesh: THREE.InstancedMesh, transform: THREE.Object3D) {
+function fract(value: number) {
+  return value - Math.floor(value);
+}
+
+function deterministicNoise(x: number, y: number, z: number) {
+  return fract(Math.sin(x * 12.9898 + y * 78.233 + z * 37.719) * 43758.5453);
+}
+
+function createPinSurface(
+  baseX: number,
+  baseY: number,
+  baseZ: number,
+  normalX: number,
+  normalY: number,
+  normalZ: number,
+): PinSurface {
+  const normalVector = new THREE.Vector3(normalX, normalY, normalZ).normalize();
+  const phaseVector = new THREE.Vector3(baseX, baseY, baseZ);
+
+  if (phaseVector.lengthSq() <= 0.000001) {
+    phaseVector.copy(normalVector);
+  } else {
+    phaseVector.normalize();
+  }
+
+  return {
+    baseX,
+    baseY,
+    baseZ,
+    normalX: normalVector.x,
+    normalY: normalVector.y,
+    normalZ: normalVector.z,
+    longitude: Math.atan2(phaseVector.x, phaseVector.z),
+    latitude: Math.asin(THREE.MathUtils.clamp(phaseVector.y, -1, 1)),
+    orientation: new THREE.Quaternion().setFromUnitVectors(PIN_LOCAL_AXIS, normalVector),
+  };
+}
+
+function createSphereSurface(longitude: number, latitude: number): PinSurface {
+  const latitudeRadius = Math.cos(latitude);
+  const normalX = Math.sin(longitude) * latitudeRadius;
+  const normalY = Math.sin(latitude);
+  const normalZ = Math.cos(longitude) * latitudeRadius;
+
+  return createPinSurface(
+    normalX * PIN_SPHERE_RADIUS,
+    normalY * PIN_SPHERE_RADIUS,
+    normalZ * PIN_SPHERE_RADIUS,
+    normalX,
+    normalY,
+    normalZ,
+  );
+}
+
+function createCubeSurface(column: number, row: number): PinSurface {
+  const faceT = ((row + 0.5) / PIN_ROWS) * 6;
+  const faceIndex = Math.min(5, Math.floor(faceT));
+  const u = ((column + 0.5) / PIN_COLUMNS) * 2 - 1;
+  const v = (faceT - faceIndex) * 2 - 1;
+  const halfSize = PIN_SPHERE_RADIUS * 0.68;
+
+  switch (faceIndex) {
+    case 0:
+      return createPinSurface(u * halfSize, v * halfSize, halfSize, 0, 0, 1);
+    case 1:
+      return createPinSurface(halfSize, v * halfSize, -u * halfSize, 1, 0, 0);
+    case 2:
+      return createPinSurface(-u * halfSize, v * halfSize, -halfSize, 0, 0, -1);
+    case 3:
+      return createPinSurface(-halfSize, v * halfSize, u * halfSize, -1, 0, 0);
+    case 4:
+      return createPinSurface(u * halfSize, halfSize, -v * halfSize, 0, 1, 0);
+    default:
+      return createPinSurface(u * halfSize, -halfSize, v * halfSize, 0, -1, 0);
+  }
+}
+
+function createTetrahedronSurface(column: number, row: number): PinSurface {
+  const tetraRadius = PIN_SPHERE_RADIUS * 1.12;
+  const vertices = [
+    new THREE.Vector3(1, 1, 1).normalize().multiplyScalar(tetraRadius),
+    new THREE.Vector3(-1, -1, 1).normalize().multiplyScalar(tetraRadius),
+    new THREE.Vector3(-1, 1, -1).normalize().multiplyScalar(tetraRadius),
+    new THREE.Vector3(1, -1, -1).normalize().multiplyScalar(tetraRadius),
+  ] as const;
+  const faces = [
+    [0, 1, 2],
+    [0, 3, 1],
+    [0, 2, 3],
+    [1, 3, 2],
+  ] as const;
+  const faceT = ((row + 0.5) / PIN_ROWS) * faces.length;
+  const faceIndex = Math.min(faces.length - 1, Math.floor(faceT));
+  let s = (column + 0.5) / PIN_COLUMNS;
+  let t = faceT - faceIndex;
+
+  if (s + t > 1) {
+    s = 1 - s;
+    t = 1 - t;
+  }
+
+  const [aIndex, bIndex, cIndex] = faces[faceIndex];
+  const a = vertices[aIndex];
+  const b = vertices[bIndex];
+  const c = vertices[cIndex];
+  const base = new THREE.Vector3()
+    .copy(a)
+    .multiplyScalar(1 - s - t)
+    .addScaledVector(b, s)
+    .addScaledVector(c, t);
+  const normal = new THREE.Vector3().copy(a).add(b).add(c).normalize();
+
+  return createPinSurface(base.x, base.y, base.z, normal.x, normal.y, normal.z);
+}
+
+function createMobiusSurface(column: number, row: number): PinSurface {
+  const u = ((column + 0.5) / PIN_COLUMNS) * Math.PI * 2;
+  const v = (((row + 0.5) / PIN_ROWS) * 2 - 1) * PIN_SPHERE_RADIUS * 0.38;
+  const radius = PIN_SPHERE_RADIUS * 0.82;
+  const halfU = u * 0.5;
+  const sinU = Math.sin(u);
+  const cosU = Math.cos(u);
+  const sinHalfU = Math.sin(halfU);
+  const cosHalfU = Math.cos(halfU);
+  const radialRadius = radius + v * cosHalfU;
+  const baseX = radialRadius * sinU;
+  const baseY = v * sinHalfU;
+  const baseZ = radialRadius * cosU;
+  const tangentU = new THREE.Vector3(
+    -v * 0.5 * sinHalfU * sinU + radialRadius * cosU,
+    v * 0.5 * cosHalfU,
+    -v * 0.5 * sinHalfU * cosU - radialRadius * sinU,
+  );
+  const tangentV = new THREE.Vector3(cosHalfU * sinU, sinHalfU, cosHalfU * cosU);
+  const normal = new THREE.Vector3().crossVectors(tangentV, tangentU).normalize();
+
+  if (normal.lengthSq() <= 0.000001) {
+    normal.set(baseX, baseY, baseZ).normalize();
+  }
+
+  return createPinSurface(baseX, baseY, baseZ, normal.x, normal.y, normal.z);
+}
+
+function createDoubleHelixSurface(column: number, row: number): PinSurface {
+  const u = (column + 0.5) / PIN_COLUMNS;
+  const v = (row + 0.5) / PIN_ROWS;
+  const tau = Math.PI * 2;
+  const turns = 3.85;
+  const height = PIN_SPHERE_RADIUS * 2.52;
+  const helixRadius = PIN_SPHERE_RADIUS * 0.64;
+  const strandTubeRadius = PIN_SPHERE_RADIUS * 0.062;
+  const strandWidth = 0.22;
+  const basePairCount = 18;
+  const pitchPerRadian = height / (turns * tau);
+  const getTheta = (verticalT: number) => (verticalT * turns + 0.04) * tau;
+  const getY = (verticalT: number) => (0.5 - verticalT) * height;
+
+  const createStrandCenter = (verticalT: number, phase: number) => {
+    const theta = getTheta(verticalT) + phase;
+
+    return new THREE.Vector3(
+      Math.sin(theta) * helixRadius,
+      getY(verticalT),
+      Math.cos(theta) * helixRadius,
+    );
+  };
+  const createRadial = (verticalT: number, phase: number) => {
+    const theta = getTheta(verticalT) + phase;
+
+    return new THREE.Vector3(Math.sin(theta), 0, Math.cos(theta)).normalize();
+  };
+  const createTangent = (verticalT: number, phase: number) => {
+    const theta = getTheta(verticalT) + phase;
+
+    return new THREE.Vector3(
+      Math.cos(theta) * helixRadius,
+      -pitchPerRadian,
+      -Math.sin(theta) * helixRadius,
+    ).normalize();
+  };
+  const createBinormal = (verticalT: number, phase: number) =>
+    new THREE.Vector3()
+      .crossVectors(createTangent(verticalT, phase), createRadial(verticalT, phase))
+      .normalize();
+
+  if (u < strandWidth || u > 1 - strandWidth) {
+    const isSecondStrand = u > 1 - strandWidth;
+    const localU = isSecondStrand ? (u - (1 - strandWidth)) / strandWidth : u / strandWidth;
+    const phase = isSecondStrand ? Math.PI : 0;
+    const tubeAngle = localU * tau + Math.sin(v * basePairCount * tau) * 0.18;
+    const center = createStrandCenter(v, phase);
+    const radial = createRadial(v, phase);
+    const binormal = createBinormal(v, phase);
+    const beadPulse = 0.92 + Math.pow(0.5 + 0.5 * Math.cos(v * basePairCount * tau), 3) * 0.26;
+    const tubeNormal = new THREE.Vector3()
+      .copy(radial)
+      .multiplyScalar(Math.cos(tubeAngle))
+      .addScaledVector(binormal, Math.sin(tubeAngle))
+      .normalize();
+    const base = center.addScaledVector(tubeNormal, strandTubeRadius * beadPulse);
+
+    return createPinSurface(base.x, base.y, base.z, tubeNormal.x, tubeNormal.y, tubeNormal.z);
+  }
+
+  const rungT = (u - strandWidth) / (1 - strandWidth * 2);
+  const pairPosition = v * basePairCount;
+  const pairCenterT = (Math.floor(pairPosition) + 0.5) / basePairCount;
+  const pairDistance = Math.abs(fract(pairPosition) - 0.5) * 2;
+  const rungStrength = 1 - smoothstep(0.18, 0.58, pairDistance);
+  const strandA = createStrandCenter(pairCenterT, 0);
+  const strandB = createStrandCenter(pairCenterT, Math.PI);
+  const radialA = createRadial(pairCenterT, 0);
+  const radialB = createRadial(pairCenterT, Math.PI);
+  const tangentFace = new THREE.Vector3(-radialA.z, 0, radialA.x).normalize();
+  const innerA = new THREE.Vector3().copy(strandA).addScaledVector(radialA, -strandTubeRadius * 0.55);
+  const innerB = new THREE.Vector3().copy(strandB).addScaledVector(radialB, -strandTubeRadius * 0.55);
+  const rungArc = Math.sin(rungT * Math.PI);
+  const rungBase = new THREE.Vector3()
+    .copy(innerA)
+    .lerp(innerB, rungT)
+    .addScaledVector(tangentFace, rungArc * strandTubeRadius * 0.52);
+  const rungNormal = new THREE.Vector3()
+    .copy(tangentFace)
+    .multiplyScalar(0.68)
+    .addScaledVector(rungT < 0.5 ? radialA : radialB, 0.42)
+    .normalize();
+  const nearestPhase = rungT < 0.5 ? 0 : Math.PI;
+  const nearestLocalT = rungT < 0.5 ? rungT / 0.5 : (rungT - 0.5) / 0.5;
+  const nearestCenter = createStrandCenter(v, nearestPhase);
+  const nearestRadial = createRadial(v, nearestPhase);
+  const nearestBinormal = createBinormal(v, nearestPhase);
+  const nucleotideAngle = (nearestLocalT - 0.5) * Math.PI;
+  const nucleotideNormal = new THREE.Vector3()
+    .copy(nearestRadial)
+    .multiplyScalar(Math.cos(nucleotideAngle))
+    .addScaledVector(nearestBinormal, Math.sin(nucleotideAngle) * 0.82)
+    .normalize();
+  const nucleotideBase = nearestCenter
+    .addScaledVector(nucleotideNormal, strandTubeRadius * 1.18)
+    .addScaledVector(createTangent(v, nearestPhase), (nearestLocalT - 0.5) * strandTubeRadius * 1.1);
+  const base = nucleotideBase.lerp(rungBase, rungStrength);
+  const normal = nucleotideNormal.lerp(rungNormal, rungStrength).normalize();
+
+  return createPinSurface(base.x, base.y, base.z, normal.x, normal.y, normal.z);
+}
+
+function createHumanFigureSurface(column: number, row: number): PinSurface {
+  const u = (column + 0.5) / PIN_COLUMNS;
+  const v = (row + 0.5) / PIN_ROWS;
+  const tau = Math.PI * 2;
+
+  const createWrappedSurface = (
+    centerX: number,
+    centerY: number,
+    centerZ: number,
+    angle: number,
+    radiusX: number,
+    radiusZ: number,
+    normalY = 0,
+  ) => {
+    const cosAngle = Math.cos(angle);
+    const sinAngle = Math.sin(angle);
+    const baseX = centerX + cosAngle * radiusX;
+    const baseZ = centerZ + sinAngle * radiusZ;
+    const normal = new THREE.Vector3(
+      cosAngle / Math.max(radiusX, 0.001),
+      normalY,
+      sinAngle / Math.max(radiusZ, 0.001),
+    ).normalize();
+
+    return createPinSurface(baseX, centerY, baseZ, normal.x, normal.y, normal.z);
+  };
+
+  if (v < 0.18) {
+    const headT = v / 0.18;
+    const angle = u * tau;
+    const polar = (headT * 0.9 + 0.05) * Math.PI;
+    const sinPolar = Math.sin(polar);
+    const cosPolar = Math.cos(polar);
+    const radiusX = PIN_SPHERE_RADIUS * 0.31;
+    const radiusY = PIN_SPHERE_RADIUS * 0.35;
+    const radiusZ = PIN_SPHERE_RADIUS * 0.29;
+    const centerY = PIN_SPHERE_RADIUS * 0.9;
+    const baseX = Math.cos(angle) * radiusX * sinPolar;
+    const baseY = centerY + cosPolar * radiusY;
+    const baseZ = Math.sin(angle) * radiusZ * sinPolar;
+    const normal = new THREE.Vector3(
+      (Math.cos(angle) * sinPolar) / radiusX,
+      cosPolar / radiusY,
+      (Math.sin(angle) * sinPolar) / radiusZ,
+    ).normalize();
+
+    return createPinSurface(baseX, baseY, baseZ, normal.x, normal.y, normal.z);
+  }
+
+  if (v < 0.24) {
+    const neckT = (v - 0.18) / 0.06;
+    const angle = u * tau;
+    const neckRadiusX = PIN_SPHERE_RADIUS * 0.18;
+    const neckRadiusZ = PIN_SPHERE_RADIUS * 0.16;
+    const neckY = PIN_SPHERE_RADIUS * (0.59 - neckT * 0.18);
+
+    return createWrappedSurface(0, neckY, 0, angle, neckRadiusX, neckRadiusZ, -0.08);
+  }
+
+  if (v < 0.58) {
+    const bodyT = (v - 0.24) / 0.34;
+    const side = u < 0.18 ? -1 : u > 0.82 ? 1 : 0;
+
+    if (side !== 0) {
+      const sideU = side < 0 ? u / 0.18 : (u - 0.82) / 0.18;
+      const armT = bodyT;
+      const armAngle = sideU * tau;
+      const armRadiusX = PIN_SPHERE_RADIUS * (0.1 + Math.sin(armT * Math.PI) * 0.035);
+      const armRadiusZ = PIN_SPHERE_RADIUS * (0.095 + Math.sin(armT * Math.PI) * 0.025);
+      const armX = side * PIN_SPHERE_RADIUS * (0.58 + armT * 0.12);
+      const armY = PIN_SPHERE_RADIUS * (0.42 - armT * 0.82);
+
+      return createWrappedSurface(
+        armX,
+        armY,
+        0,
+        armAngle,
+        armRadiusX,
+        armRadiusZ,
+        -0.08,
+      );
+    }
+
+    const torsoU = (u - 0.18) / 0.64;
+    const torsoAngle = torsoU * tau;
+    const torsoRadiusX = PIN_SPHERE_RADIUS * (0.47 - bodyT * 0.14 + Math.sin(bodyT * Math.PI) * 0.07);
+    const torsoRadiusZ = PIN_SPHERE_RADIUS * (0.25 + Math.sin(bodyT * Math.PI) * 0.05);
+    const torsoY = PIN_SPHERE_RADIUS * (0.43 - bodyT * 0.85);
+    const shoulderLift = (0.5 - bodyT) * 0.1;
+
+    return createWrappedSurface(
+      0,
+      torsoY,
+      0,
+      torsoAngle,
+      torsoRadiusX,
+      torsoRadiusZ,
+      shoulderLift,
+    );
+  }
+
+  const legT = (v - 0.58) / 0.42;
+  const isRightLeg = u >= 0.5;
+  const legU = isRightLeg ? (u - 0.5) * 2 : u * 2;
+  const legAngle = legU * tau;
+  const side = isRightLeg ? 1 : -1;
+  const legRadiusX = PIN_SPHERE_RADIUS * (0.18 - legT * 0.035);
+  const legRadiusZ = PIN_SPHERE_RADIUS * (0.15 - legT * 0.025);
+  const stance = PIN_SPHERE_RADIUS * (0.16 + legT * 0.08);
+  const legY = PIN_SPHERE_RADIUS * (-0.48 - legT * 0.95);
+  const footPush = smoothstep(0.78, 1, legT) * PIN_SPHERE_RADIUS * 0.13;
+  const footSpread = smoothstep(0.78, 1, legT) * side * PIN_SPHERE_RADIUS * 0.16;
+
+  return createWrappedSurface(
+    side * stance + footSpread,
+    legY,
+    0,
+    legAngle,
+    legRadiusX + footPush,
+    legRadiusZ + footPush * 0.45,
+    -0.04,
+  );
+}
+
+function createPinStates(
+  pinMesh: THREE.InstancedMesh,
+  pinHeadMesh: THREE.InstancedMesh,
+  transform: THREE.Object3D,
+) {
   const pins: PinState[] = [];
   let pinIndex = 0;
 
@@ -294,10 +695,71 @@ function createPinStates(pinMesh: THREE.InstancedMesh, transform: THREE.Object3D
     for (let column = 0; column < PIN_COLUMNS; column += 1) {
       const x = (column - (PIN_COLUMNS - 1) / 2) * PIN_SPACING;
       const y = (row - (PIN_ROWS - 1) / 2) * PIN_SPACING;
+      const longitude = (column / PIN_COLUMNS) * Math.PI * 2 + Math.PI;
+      const latitudeT = (row + 0.5) / PIN_ROWS;
+      const latitude = (0.5 - latitudeT) * Math.PI;
+      const sphereSurface = createSphereSurface(longitude, latitude);
+      const cubeSurface = createCubeSurface(column, row);
+      const tetrahedronSurface = createTetrahedronSurface(column, row);
+      const mobiusSurface = createMobiusSurface(column, row);
+      const doubleHelixSurface = createDoubleHelixSurface(column, row);
+      const humanSurface = createHumanFigureSurface(column, row);
+      const wallOrientation = new THREE.Quaternion().setFromAxisAngle(
+        new THREE.Vector3(1, 0, 0),
+        -Math.PI / 2,
+      );
+      const wallSurface: PinSurface = {
+        baseX: x,
+        baseY: y,
+        baseZ: 0,
+        normalX: 0,
+        normalY: 0,
+        normalZ: 1,
+        longitude,
+        latitude,
+        orientation: wallOrientation,
+      };
+      const resonanceSeed = deterministicNoise(column, row, sphereSurface.normalZ * 17);
+      const bassAffinity = 0.18 + Math.pow(clamp01(0.5 + 0.5 * Math.cos(latitude * 3.2) * Math.cos(longitude * 2)), 1.55) * 0.82;
+      const lowMidAffinity = 0.18 + Math.pow(clamp01(0.5 + 0.5 * Math.sin(latitude * 4.1 + longitude * 2.5)), 1.4) * 0.82;
+      const midAffinity = 0.18 + Math.pow(clamp01(0.5 + 0.5 * Math.cos(longitude * 5.5 - latitude * 2.8)), 1.35) * 0.82;
+      const highMidAffinity = 0.18 + Math.pow(clamp01(0.5 + 0.5 * Math.sin(longitude * 7.5 + latitude * 5.2)), 1.55) * 0.82;
+      const trebleAffinity =
+        0.16 +
+        Math.pow(
+          clamp01(0.5 + 0.5 * Math.sin(longitude * 13.0 - latitude * 9.0 + resonanceSeed * Math.PI * 2)),
+          1.75,
+        ) *
+          0.84;
 
-      pins.push({
+      const pin: PinState = {
         x,
         y,
+        baseX: sphereSurface.baseX,
+        baseY: sphereSurface.baseY,
+        baseZ: sphereSurface.baseZ,
+        normalX: sphereSurface.normalX,
+        normalY: sphereSurface.normalY,
+        normalZ: sphereSurface.normalZ,
+        longitude: sphereSurface.longitude,
+        latitude: sphereSurface.latitude,
+        orientation: sphereSurface.orientation.clone(),
+        surfaces: {
+          sphere: sphereSurface,
+          cube: cubeSurface,
+          tetrahedron: tetrahedronSurface,
+          mobius: mobiusSurface,
+          doubleHelix: doubleHelixSurface,
+          human: humanSurface,
+          wall: wallSurface,
+        },
+        bassAffinity,
+        lowMidAffinity,
+        midAffinity,
+        highMidAffinity,
+        trebleAffinity,
+        beatAffinity: 0.35 + deterministicNoise(column * 0.37, row * 0.61, 4.7) * 0.65,
+        resonancePhase: resonanceSeed * Math.PI * 2,
         centerDistance: Math.sqrt(x * x + y * y),
         normalizedX: column / (PIN_COLUMNS - 1),
         normalizedY: row / (PIN_ROWS - 1),
@@ -306,13 +768,24 @@ function createPinStates(pinMesh: THREE.InstancedMesh, transform: THREE.Object3D
         velocityZ: 0,
         currentColor: BACKGROUND_COLOR.clone(),
         targetColor: BACKGROUND_COLOR.clone(),
-      });
+      };
 
-      transform.position.set(x, y, PIN_HOME_Z);
-      transform.rotation.x = PIN_ROTATION_X;
+      pins.push(pin);
+
+      transform.position.set(pin.baseX, pin.baseY, pin.baseZ);
+      transform.quaternion.copy(pin.orientation);
       transform.updateMatrix();
       pinMesh.setMatrixAt(pinIndex, transform.matrix);
       pinMesh.setColorAt(pinIndex, BACKGROUND_COLOR);
+
+      transform.position.set(
+        pin.baseX + pin.normalX * PIN_HEAD_OFFSET,
+        pin.baseY + pin.normalY * PIN_HEAD_OFFSET,
+        pin.baseZ + pin.normalZ * PIN_HEAD_OFFSET,
+      );
+      transform.updateMatrix();
+      pinHeadMesh.setMatrixAt(pinIndex, transform.matrix);
+      pinHeadMesh.setColorAt(pinIndex, BACKGROUND_COLOR);
       pinIndex += 1;
     }
   }
@@ -320,6 +793,10 @@ function createPinStates(pinMesh: THREE.InstancedMesh, transform: THREE.Object3D
   pinMesh.instanceMatrix.needsUpdate = true;
   if (pinMesh.instanceColor) {
     pinMesh.instanceColor.needsUpdate = true;
+  }
+  pinHeadMesh.instanceMatrix.needsUpdate = true;
+  if (pinHeadMesh.instanceColor) {
+    pinHeadMesh.instanceColor.needsUpdate = true;
   }
 
   return pins;
@@ -364,7 +841,7 @@ function createFireworkSystem(scene: THREE.Scene) {
   const points = new THREE.Points(geometry, material);
   scene.add(points);
 
-  const trigger = (strength: number) => {
+  const trigger = (strength: number, solidColor?: THREE.Color | null) => {
     const particleScale = 0.65 + strength * 0.55;
 
     for (let index = 0; index < FIREWORK_PARTICLE_COUNT; index += 1) {
@@ -373,7 +850,7 @@ function createFireworkSystem(scene: THREE.Scene) {
       positions[offset + 1] = (Math.random() - 0.5) * 2;
       positions[offset + 2] = 0;
 
-      const color = BRAND_COLORS[Math.floor(Math.random() * BRAND_COLORS.length)];
+      const color = solidColor ?? BRAND_COLORS[Math.floor(Math.random() * BRAND_COLORS.length)];
       const intensity = 1.05 + strength * 1.35 + Math.random() * 0.75;
       colors[offset] = color.r * intensity;
       colors[offset + 1] = color.g * intensity;
@@ -446,60 +923,6 @@ function createFireworkSystem(scene: THREE.Scene) {
   };
 
   return {trigger, update, dispose};
-}
-
-function createPlasmaGlowField(scene: THREE.Scene) {
-  const colorA = new THREE.Color();
-  const colorB = new THREE.Color();
-  const colorC = new THREE.Color();
-  const geometry = new THREE.PlaneGeometry(PLASMA_FIELD_WIDTH, PLASMA_FIELD_HEIGHT);
-  const material = new THREE.ShaderMaterial({
-    uniforms: THREE.UniformsUtils.clone(PlasmaFieldShader.uniforms),
-    vertexShader: PlasmaFieldShader.vertexShader,
-    fragmentShader: PlasmaFieldShader.fragmentShader,
-    transparent: true,
-    blending: THREE.AdditiveBlending,
-    depthWrite: false,
-    depthTest: false,
-    side: THREE.DoubleSide,
-  });
-  const mesh = new THREE.Mesh(geometry, material);
-
-  mesh.position.z = -18;
-  mesh.renderOrder = 2;
-  mesh.frustumCulled = false;
-  scene.add(mesh);
-
-  const update = (time: number, audio: AudioFrame) => {
-    const seconds = time / 1000;
-
-    mesh.rotation.z = Math.sin(seconds * 0.08) * (0.025 + audio.lowMid * 0.03);
-    mesh.scale.setScalar(1 + audio.volume * 0.025 + audio.beatEnergy * 0.035);
-
-    material.uniforms.time.value = seconds;
-    material.uniforms.bass.value = audio.bass;
-    material.uniforms.lowMid.value = audio.lowMid;
-    material.uniforms.mid.value = audio.mid;
-    material.uniforms.highMid.value = audio.highMid;
-    material.uniforms.treble.value = audio.treble;
-    material.uniforms.volume.value = audio.volume;
-    material.uniforms.beat.value = audio.beatEnergy;
-
-    setGradientColor(colorA, seconds * 0.055 + audio.bass * 0.18);
-    setGradientColor(colorB, seconds * 0.071 + 0.31 + audio.highMid * 0.2);
-    setGradientColor(colorC, seconds * 0.047 + 0.62 + audio.treble * 0.22);
-    material.uniforms.colorA.value.copy(colorA).multiplyScalar(0.9 + audio.volume * 1.4);
-    material.uniforms.colorB.value.copy(colorB).multiplyScalar(0.75 + audio.highMid * 1.6 + audio.beatEnergy * 0.7);
-    material.uniforms.colorC.value.copy(colorC).multiplyScalar(0.68 + audio.treble * 1.8 + audio.beatEnergy * 0.65);
-  };
-
-  const dispose = () => {
-    scene.remove(mesh);
-    geometry.dispose();
-    material.dispose();
-  };
-
-  return {update, dispose};
 }
 
 function createWaveRibbonSystem(scene: THREE.Scene) {
@@ -585,7 +1008,7 @@ function createWaveRibbonSystem(scene: THREE.Scene) {
     });
   }
 
-  const update = (time: number, audio: AudioFrame) => {
+  const update = (time: number, audio: AudioFrame, colorShift = 0, solidColor?: THREE.Color | null) => {
     const seconds = time / 1000;
 
     for (let ribbonIndex = 0; ribbonIndex < ribbons.length; ribbonIndex += 1) {
@@ -623,7 +1046,7 @@ function createWaveRibbonSystem(scene: THREE.Scene) {
 
       ribbon.positionAttribute.needsUpdate = true;
       ribbon.material.opacity = Math.min(0.42, (0.045 + audio.volume * 0.18 + audio.beatEnergy * 0.08) * rowFade);
-      setGradientColor(color, ribbonIndex / WAVE_RIBBON_COUNT + seconds * 0.045 + audio.treble * 0.16);
+      setGradientColor(color, ribbonIndex / WAVE_RIBBON_COUNT + seconds * 0.045 + audio.treble * 0.16, colorShift, solidColor);
       ribbon.material.color.copy(color).multiplyScalar(0.85 + audio.volume * 1.55);
     }
 
@@ -654,7 +1077,7 @@ function createWaveRibbonSystem(scene: THREE.Scene) {
 
       ring.positionAttribute.needsUpdate = true;
       ring.material.opacity = Math.min(0.34, 0.038 + audio.volume * 0.1 + audio.beatEnergy * 0.075);
-      setGradientColor(color, ringIndex / OUTER_RING_COUNT + seconds * 0.035 + audio.lowMid * 0.18);
+      setGradientColor(color, ringIndex / OUTER_RING_COUNT + seconds * 0.035 + audio.lowMid * 0.18, colorShift, solidColor);
       ring.material.color.copy(color).multiplyScalar(0.72 + audio.volume * 1.2);
     }
   };
@@ -662,20 +1085,18 @@ function createWaveRibbonSystem(scene: THREE.Scene) {
   const dispose = () => {
     scene.remove(group);
 
-    for (const ribbon of ribbons) {
-      ribbon.positionAttribute.array = new Float32Array(0);
-      ribbon.material.dispose();
-    }
-
-    for (const ring of rings) {
-      ring.positionAttribute.array = new Float32Array(0);
-      ring.material.dispose();
-    }
-
     group.traverse((object) => {
       const line = object as THREE.Line<THREE.BufferGeometry, THREE.LineBasicMaterial>;
       line.geometry?.dispose();
     });
+
+    for (const ribbon of ribbons) {
+      ribbon.material.dispose();
+    }
+
+    for (const ring of rings) {
+      ring.material.dispose();
+    }
   };
 
   return {update, dispose};
@@ -1067,16 +1488,19 @@ function getLayeredWaveOffset(
   return wideRadial + diagonalSwell + crossCurrent + waveformWake + spectralUndulation;
 }
 
+
+
 export function createPinVisualizerScene(
   container: HTMLDivElement,
   options: PinVisualizerSceneOptions = {},
 ): SceneController {
   const fallbackAudio = createSilentAudioProvider();
   const scene = new THREE.Scene();
-  scene.fog = new THREE.FogExp2(0x000000, 0.014);
+  const sceneFog = new THREE.FogExp2(0x000000, MAX_FOG_DENSITY);
+  scene.fog = sceneFog;
 
   const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
-  camera.position.set(0, 0, 60);
+  camera.position.set(0, 0, CAMERA_DEFAULT_Z);
 
   const renderer = new THREE.WebGLRenderer({antialias: true, alpha: true});
   renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -1086,13 +1510,14 @@ export function createPinVisualizerScene(
   renderer.domElement.style.display = 'block';
   renderer.domElement.style.width = '100%';
   renderer.domElement.style.height = '100%';
+  renderer.domElement.style.cursor = 'grab';
+  renderer.domElement.style.touchAction = 'none';
   renderer.domElement.setAttribute('aria-hidden', 'true');
   container.appendChild(renderer.domElement);
 
   const composer = new EffectComposer(renderer);
   const renderPass = new RenderPass(scene, camera);
   const waveWarpPass = new ShaderPass(WaveWarpShader);
-  const bloomPass = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.22, 0.52, 0.68);
   const rgbShiftPass = new ShaderPass(RGBShiftShader);
   const afterimagePass = new AfterimagePass();
 
@@ -1103,22 +1528,39 @@ export function createPinVisualizerScene(
 
   composer.addPass(renderPass);
   composer.addPass(waveWarpPass);
-  composer.addPass(bloomPass);
   composer.addPass(rgbShiftPass);
   composer.addPass(afterimagePass);
 
-  scene.add(new THREE.AmbientLight(0xffffff, 0.52));
+  scene.add(new THREE.AmbientLight(0xffffff, 0.74));
 
   const directionalLight = new THREE.DirectionalLight(0xffffff, 1.08);
-  directionalLight.position.set(0, 0, 30);
+  directionalLight.position.set(0, -10, 48);
   scene.add(directionalLight);
 
-  const pointLight = new THREE.PointLight(0xffffff, 2.8, 112);
-  pointLight.position.set(0, 0, 20);
+  const pointLight = new THREE.PointLight(0xffffff, 3.2, 150);
+  pointLight.position.set(0, 0, 44);
   scene.add(pointLight);
+
+  const orbitLights = BRAND_COLORS.map((color, index) => {
+    const light = new THREE.PointLight(color, 1.4, ORBIT_LIGHT_DISTANCE * 2.6, 1.45);
+    const phase = (index / BRAND_COLORS.length) * Math.PI * 2;
+
+    light.position.set(
+      Math.cos(phase) * ORBIT_LIGHT_DISTANCE,
+      Math.sin(phase * 1.7) * ORBIT_LIGHT_HEIGHT,
+      Math.sin(phase) * ORBIT_LIGHT_DISTANCE,
+    );
+    scene.add(light);
+
+    return light;
+  });
+
+  const pinGroup = new THREE.Group();
+  scene.add(pinGroup);
 
   const pinGeometry = new THREE.CylinderGeometry(PIN_RADIUS, PIN_RADIUS, PIN_LENGTH, 8);
   pinGeometry.translate(0, PIN_LENGTH / 2, 0);
+  const pinHeadGeometry = new THREE.IcosahedronGeometry(PIN_HEAD_RADIUS, 2);
 
   const pinMaterial = new THREE.MeshStandardMaterial({
     color: 0xffffff,
@@ -1127,35 +1569,117 @@ export function createPinVisualizerScene(
     metalness: 0.9,
     roughness: 0.3,
   });
+  const pinHeadMaterial = new THREE.MeshBasicMaterial({
+    color: 0xffffff,
+    transparent: true,
+    opacity: 0.86,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+    toneMapped: false,
+  });
 
   const pinMesh = new THREE.InstancedMesh(pinGeometry, pinMaterial, PIN_COUNT);
+  pinMesh.frustumCulled = false;
   pinMesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(PIN_COUNT * 3), 3);
-  scene.add(pinMesh);
+  pinGroup.add(pinMesh);
+
+  const pinHeadMesh = new THREE.InstancedMesh(pinHeadGeometry, pinHeadMaterial, PIN_COUNT);
+  pinHeadMesh.frustumCulled = false;
+  pinHeadMesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(PIN_COUNT * 3), 3);
+  pinGroup.add(pinHeadMesh);
 
   const transform = new THREE.Object3D();
-  const pins = createPinStates(pinMesh, transform);
-  const fireworks = createFireworkSystem(scene);
-  const plasmaGlow = createPlasmaGlowField(scene);
-  const waveRibbons = createWaveRibbonSystem(scene);
-  // const reactiveShapes = createReactiveShapeSystem(scene);
-  // const proceduralElements = createProceduralElementSystem(scene);
+  const pins = createPinStates(pinMesh, pinHeadMesh, transform);
+  const pinZSnapshot = new Float32Array(PIN_COUNT);
+   const fireworks = createFireworkSystem(scene);
+   const waveRibbons = createWaveRibbonSystem(scene);
+  const reactiveShapes = REACTIVE_SHAPES_ENABLED ? createReactiveShapeSystem(scene) : null;
+  const proceduralElements = PROCEDURAL_ELEMENTS_ENABLED ? createProceduralElementSystem(scene) : null;
   const beatWaves: BeatWave[] = [];
+  const solidColorScratch = new THREE.Color();
 
   let lastFrameTime = performance.now();
   let animationId = 0;
   let isDisposed = false;
   let hasReportedReady = false;
+  let cameraBaseZ = CAMERA_DEFAULT_Z;
+  let cameraTargetY = -CAMERA_TARGET_SHIFT;
+  let wallCameraBaseZ = CAMERA_DEFAULT_Z;
+  let wallCameraTargetY = 0;
+  let manualOrbitYaw = 0;
+  let manualOrbitPitch = 0;
+  let orbitPointerId: number | null = null;
+  let orbitPointerX = 0;
+  let orbitPointerY = 0;
+
+  const endPointerOrbit = (event: PointerEvent) => {
+    if (orbitPointerId !== event.pointerId) {
+      return;
+    }
+
+    try {
+      renderer.domElement.releasePointerCapture(event.pointerId);
+    } catch {
+      // Pointer capture can already be released by the browser on cancellation.
+    }
+
+    orbitPointerId = null;
+    renderer.domElement.style.cursor = 'grab';
+    event.preventDefault();
+  };
+
+  const handlePointerDown = (event: PointerEvent) => {
+    if (event.button !== 0 && event.pointerType === 'mouse') {
+      return;
+    }
+
+    orbitPointerId = event.pointerId;
+    orbitPointerX = event.clientX;
+    orbitPointerY = event.clientY;
+    renderer.domElement.style.cursor = 'grabbing';
+    renderer.domElement.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  };
+
+  const handlePointerMove = (event: PointerEvent) => {
+    if (orbitPointerId !== event.pointerId) {
+      return;
+    }
+
+    const deltaX = event.clientX - orbitPointerX;
+    const deltaY = event.clientY - orbitPointerY;
+
+    manualOrbitYaw -= deltaX * 0.006;
+    manualOrbitPitch = THREE.MathUtils.clamp(manualOrbitPitch - deltaY * 0.0045, -1.15, 1.15);
+    orbitPointerX = event.clientX;
+    orbitPointerY = event.clientY;
+    event.preventDefault();
+  };
+
+  renderer.domElement.addEventListener('pointerdown', handlePointerDown);
+  window.addEventListener('pointermove', handlePointerMove);
+  window.addEventListener('pointerup', endPointerOrbit);
+  window.addEventListener('pointercancel', endPointerOrbit);
 
   const resize = () => {
     const {width, height} = getContainerSize(container);
     const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+    const cameraFrame = getResponsiveCameraFrame(width, height, camera.fov);
+    const wallFrame = getWallCameraFrame(width, height, camera.fov);
 
+    const isWall = options.getShape?.() === 'wall';
     camera.aspect = width / height;
+    cameraBaseZ = cameraFrame.distance;
+    cameraTargetY = cameraFrame.targetY;
+    wallCameraBaseZ = wallFrame.distance;
+    wallCameraTargetY = wallFrame.targetY;
+    camera.position.z = getCameraDistance(isWall ? wallCameraBaseZ : cameraBaseZ, options.getZoom?.() ?? 1);
     camera.updateProjectionMatrix();
+    camera.lookAt(0, isWall ? wallCameraTargetY : cameraTargetY, 0);
+
     renderer.setPixelRatio(pixelRatio);
     renderer.setSize(width, height, false);
     composer.setSize(width, height);
-    bloomPass.setSize(width, height);
   };
 
   const resizeObserver = new ResizeObserver(resize);
@@ -1163,12 +1687,34 @@ export function createPinVisualizerScene(
   window.addEventListener('resize', resize);
   resize();
 
-  const updatePins = (time: number, audio: AudioFrame) => {
+  const updatePins = (time: number, audio: AudioFrame, colorShift: number, solidColor?: THREE.Color | null) => {
     const seconds = time / 1000;
     const colorPhase = seconds * (0.09 + audio.volume * 0.08);
+    const currentShape = options.getShape?.() ?? 'sphere';
+    const colorIntensity = options.getColorIntensity?.() ?? 1;
+    const pinHeightMult = options.getPinHeight?.() ?? 1;
+    const pinSizeMult = options.getPinSize?.() ?? 1;
+
+    // Snapshot heights so neighbor reads in the coupling step see a stable
+    // previous-frame field, not a half-updated one.
+    for (let index = 0; index < PIN_COUNT; index += 1) {
+      pinZSnapshot[index] = pins[index].currentZ;
+    }
 
     for (let index = 0; index < PIN_COUNT; index += 1) {
       const pin = pins[index];
+      const surface = pin.surfaces[currentShape];
+
+      pin.baseX = surface.baseX;
+      pin.baseY = surface.baseY;
+      pin.baseZ = surface.baseZ;
+      pin.normalX = surface.normalX;
+      pin.normalY = surface.normalY;
+      pin.normalZ = surface.normalZ;
+      pin.longitude = surface.longitude;
+      pin.latitude = surface.latitude;
+      pin.orientation.copy(surface.orientation);
+
       const centeredX = Math.abs(pin.normalizedX - 0.5) * 2;
       const centeredY = Math.abs(pin.normalizedY - 0.5) * 2;
       const centerFalloff = clamp01(1 - pin.centerDistance / (FIELD_RADIUS * 0.78));
@@ -1198,9 +1744,111 @@ export function createPinVisualizerScene(
         audio.spectrum[spectrumIndex] * 0.62 + audio.spectrum[mirroredSpectrumIndex] * 0.38;
       const waveformX = audio.waveform[waveformIndex];
       const waveformY = audio.waveform[verticalWaveformIndex] * 0.65 + audio.waveform[diagonalWaveformIndex] * 0.35;
+      const bassReaction = audio.bass * pin.bassAffinity;
+      const lowMidReaction = audio.lowMid * pin.lowMidAffinity;
+      const midReaction = audio.mid * pin.midAffinity;
+      const highMidReaction = audio.highMid * pin.highMidAffinity;
+      const trebleReaction = audio.treble * pin.trebleAffinity;
+      const bandReaction = clamp01(
+        bassReaction * 0.9 +
+          lowMidReaction * 0.7 +
+          midReaction * 0.62 +
+          highMidReaction * 0.58 +
+          trebleReaction * 0.68 +
+          spectrumEnergy * 0.5,
+      );
+      const wholeSphereEnergy = clamp01(
+        audio.volume * 0.36 +
+          audio.bass * 0.2 +
+          audio.lowMid * 0.16 +
+          audio.mid * 0.14 +
+          audio.highMid * 0.14 +
+          audio.treble * 0.18 +
+          audio.beatEnergy * 0.22,
+      );
+      const longitudeSweep = clamp01(
+        0.5 +
+          0.5 *
+            Math.sin(
+              pin.normalX * 7.5 +
+                pin.normalZ * 5.2 +
+                seconds * (1.35 + audio.highMid * 5.8 + audio.treble * 3.2),
+            ),
+      );
+      const latitudeSweep = clamp01(
+        0.5 +
+          0.5 *
+            Math.cos(
+              pin.normalY * 9.2 -
+                pin.normalZ * 4.4 +
+                seconds * (1.05 + audio.lowMid * 4.2 + audio.mid * 4.8),
+            ),
+      );
+      const cymaticBass =
+        Math.abs(Math.sin(pin.longitude * 3 + pin.latitude * 4 + pin.resonancePhase * 0.18)) *
+        Math.abs(Math.cos(pin.latitude * 5.5 - seconds * (0.35 + audio.bass * 1.8)));
+      const cymaticMid =
+        Math.abs(
+          Math.sin(pin.longitude * 7 - pin.latitude * 6 + seconds * (0.5 + audio.mid * 2.6) + pin.resonancePhase),
+        ) *
+        Math.abs(Math.cos((pin.normalX - pin.normalZ) * 8.5 + seconds * (0.4 + audio.lowMid * 2.2)));
+      const cymaticTreble = Math.pow(
+        Math.abs(
+          Math.sin(
+            pin.longitude * 15 +
+              pin.latitude * 11 +
+              seconds * (1.2 + audio.treble * 7.5) +
+              pin.resonancePhase * 1.7,
+          ),
+        ),
+        2.2,
+      );
+      const cymaticField = clamp01(
+        cymaticBass * bassReaction +
+          cymaticMid * (lowMidReaction + midReaction) * 0.72 +
+          cymaticTreble * (highMidReaction + trebleReaction) * 0.82 +
+          audio.beatEnergy * pin.beatAffinity * 0.42,
+      );
+      const curlA = Math.sin(
+        pin.longitude * 4.5 +
+          pin.latitude * 5.5 +
+          seconds * (0.62 + audio.lowMid * 4.8) +
+          waveformY * 3.8 +
+          pin.resonancePhase,
+      );
+      const curlB = Math.cos(
+        pin.longitude * -5.8 +
+          pin.latitude * 3.7 -
+          seconds * (0.7 + audio.mid * 4.1) +
+          waveformX * 4.2,
+      );
+      const fluidVorticity = curlA * curlB;
+      const fluidEnergy = clamp01(
+        Math.abs(fluidVorticity) * (audio.lowMid * 0.58 + audio.mid * 0.5 + audio.volume * 0.34) +
+          spectrumEnergy * 0.22,
+      );
+      const globalPinReaction = clamp01(
+        wholeSphereEnergy * 0.72 +
+          spectrumEnergy * 0.58 +
+          (longitudeSweep * audio.highMid + latitudeSweep * audio.treble) * 0.54 +
+          bandReaction * 0.56 +
+          cymaticField * 0.62 +
+          fluidEnergy * 0.38 +
+          audio.beatEnergy * 0.34,
+      );
       const waveformRibbon =
         waveformX * (1 - Math.min(1, Math.abs(pin.normalizedY - 0.5) * 2.3));
       const bassDome = audio.bass * centerFalloff * centerFalloff * 12.5;
+      const surfacePulse =
+        wholeSphereEnergy * (1.8 + longitudeSweep * 2.7 + latitudeSweep * 1.4) +
+        bandReaction * (1.4 + cymaticField * 3.4) +
+        audio.beatEnergy * pin.beatAffinity * (1.2 + longitudeSweep * 2.5);
+      const sphericalLightWave =
+        Math.sin((pin.normalX + pin.normalY * 0.7 - pin.normalZ * 0.45) * 8.5 + seconds * (1.4 + audio.mid * 4.6)) *
+        wholeSphereEnergy *
+        2.4;
+      const cymaticLift = cymaticField * (3.2 + bassReaction * 4.8 + trebleReaction * 3.5);
+      const fluidLift = fluidVorticity * fluidEnergy * (4.8 + audio.volume * 5.5);
       const midTerrain =
         Math.sin(pin.x * 0.16 + seconds * (1.6 + audio.mid * 5)) *
         Math.cos(pin.y * 0.12 - seconds * (1.2 + audio.lowMid * 4)) *
@@ -1213,16 +1861,35 @@ export function createPinVisualizerScene(
 
       pin.targetZ =
         PIN_HOME_Z +
-        bassDome +
+        (bassDome +
         spectralRidge +
         waveformRibbon * 6 +
         midTerrain +
         trebleShimmer +
+        surfacePulse +
+        sphericalLightWave +
+        cymaticLift +
+        fluidLift +
         layeredWave +
-        beatWave;
+        beatWave) * pinHeightMult;
 
-      const force = (pin.targetZ - pin.currentZ) * SPRING_STIFFNESS;
-      pin.velocityZ = (pin.velocityZ + force) * SPRING_DAMPING;
+      const springForce = (pin.targetZ - pin.currentZ) * SPRING_STIFFNESS;
+      const column = index % PIN_COLUMNS;
+      const row = (index - column) / PIN_COLUMNS;
+      let neighborDelta = 0;
+      if (column > 0) {
+        neighborDelta += pinZSnapshot[index - 1] - pin.currentZ;
+      }
+      if (column < PIN_COLUMNS - 1) {
+        neighborDelta += pinZSnapshot[index + 1] - pin.currentZ;
+      }
+      if (row > 0) {
+        neighborDelta += pinZSnapshot[index - PIN_COLUMNS] - pin.currentZ;
+      }
+      if (row < PIN_ROWS - 1) {
+        neighborDelta += pinZSnapshot[index + PIN_COLUMNS] - pin.currentZ;
+      }
+      pin.velocityZ = (pin.velocityZ + springForce + neighborDelta * PIN_COUPLING_K) * SPRING_DAMPING;
       pin.currentZ += pin.velocityZ;
 
       setGradientColor(
@@ -1232,31 +1899,107 @@ export function createPinVisualizerScene(
           colorPhase +
           spectrumEnergy * 0.22 +
           audio.bass * centerFalloff * 0.16 +
+          globalPinReaction * 0.2 +
+          bandReaction * 0.18 +
+          cymaticField * 0.16 +
+          fluidVorticity * 0.025 +
           edgeGlow * (0.12 + audio.highMid * 0.18 + audio.treble * 0.18) +
           layeredWave * 0.006,
+        colorShift,
+        solidColor,
       );
 
       const pinEnergy = clamp01(
         spectrumEnergy * 0.5 +
+          globalPinReaction * 0.68 +
+          bandReaction * 0.7 +
+          cymaticField * 0.56 +
+          fluidEnergy * 0.32 +
           centerFalloff * audio.bass * 0.6 +
+          wholeSphereEnergy * 0.44 +
           audio.treble * 0.16 +
           edgeGlow * (audio.highMid * 0.28 + audio.treble * 0.32 + audio.volume * 0.12) +
           Math.abs(layeredWave) * 0.024,
       );
-      pin.targetColor.multiplyScalar(0.28 + audio.volume * 0.66 + pinEnergy * 0.98 + edgeGlow * 0.32);
-      pin.targetColor.addScalar(audio.beatEnergy * (centerFalloff * 0.1 + edgeGlow * 0.16) + audio.volume * edgeGlow * 0.06);
+      const sphereFrontGlow = Math.pow(clamp01(pin.normalZ * 0.5 + 0.5), 0.8) * 0.16;
+      const spherePoleGlow = Math.pow(Math.abs(pin.normalY), 0.9) * 0.08;
+      const humanWrapGlow =
+        currentShape === 'human'
+          ? Math.pow(Math.abs(pin.normalZ), 0.78) * 0.18 + Math.pow(Math.abs(pin.normalX), 0.9) * 0.06
+          : 0;
+
+      pin.targetColor.multiplyScalar(
+        (0.42 +
+          audio.volume * 0.7 +
+          wholeSphereEnergy * 0.55 +
+          pinEnergy * 1.22 +
+          edgeGlow * 0.28 +
+          sphereFrontGlow +
+          spherePoleGlow +
+          humanWrapGlow) * colorIntensity,
+      );
+      pin.targetColor.addScalar(
+        (0.018 +
+          globalPinReaction * 0.08 +
+          audio.beatEnergy * (centerFalloff * 0.1 + edgeGlow * 0.16) +
+          audio.volume * edgeGlow * 0.06 +
+          humanWrapGlow * 0.08) * colorIntensity,
+      );
+      pin.targetColor.r = Math.min(pin.targetColor.r, 1);
+      pin.targetColor.g = Math.min(pin.targetColor.g, 1);
+      pin.targetColor.b = Math.min(pin.targetColor.b, 1);
       pin.currentColor.lerp(pin.targetColor, COLOR_LERP_ALPHA);
 
-      transform.position.set(pin.x, pin.y, pin.currentZ);
-      transform.rotation.x = PIN_ROTATION_X;
+      const pinOffset = (pin.currentZ - PIN_HOME_Z) * PIN_SPHERE_RESPONSE_SCALE;
+      const bassSize = bassReaction * (0.85 + cymaticBass * 0.95);
+      const midSize = (lowMidReaction + midReaction) * (0.48 + cymaticMid * 0.72 + fluidEnergy * 0.55);
+      const trebleSize = (highMidReaction + trebleReaction) * (0.34 + cymaticTreble * 0.58);
+      const sizeReaction = clamp01(
+        bassSize * 0.78 +
+          midSize * 0.48 +
+          trebleSize * 0.34 +
+          bandReaction * 0.42 +
+          audio.beatEnergy * pin.beatAffinity * 0.36,
+      );
+      const stemLengthScale = 0.72 + (sizeReaction * 1.38 + bassReaction * 0.42 + audio.beatEnergy * pin.beatAffinity * 0.3) * pinSizeMult;
+      const stemThicknessScale =
+        0.72 +
+        (sizeReaction * 0.72 +
+        trebleReaction * 0.32 +
+        fluidEnergy * 0.26 +
+        audio.beatEnergy * pin.beatAffinity * 0.16) * pinSizeMult;
+      const pinHeadOffset = pinOffset + PIN_LENGTH * stemLengthScale + PIN_HEAD_RADIUS * (0.55 + sizeReaction * 0.65 * pinSizeMult);
+      const pinHeadScale = 0.76 + (sizeReaction * 1.05 + globalPinReaction * 0.36 + audio.beatEnergy * 0.24) * pinSizeMult;
+
+      transform.scale.set(stemThicknessScale, stemLengthScale, stemThicknessScale);
+      transform.position.set(
+        pin.baseX + pin.normalX * pinOffset,
+        pin.baseY + pin.normalY * pinOffset,
+        pin.baseZ + pin.normalZ * pinOffset,
+      );
+      transform.quaternion.copy(pin.orientation);
       transform.updateMatrix();
       pinMesh.setMatrixAt(index, transform.matrix);
       pinMesh.setColorAt(index, pin.currentColor);
+
+      transform.scale.setScalar(pinHeadScale);
+      transform.position.set(
+        pin.baseX + pin.normalX * pinHeadOffset,
+        pin.baseY + pin.normalY * pinHeadOffset,
+        pin.baseZ + pin.normalZ * pinHeadOffset,
+      );
+      transform.updateMatrix();
+      pinHeadMesh.setMatrixAt(index, transform.matrix);
+      pinHeadMesh.setColorAt(index, pin.currentColor);
     }
 
     pinMesh.instanceMatrix.needsUpdate = true;
     if (pinMesh.instanceColor) {
       pinMesh.instanceColor.needsUpdate = true;
+    }
+    pinHeadMesh.instanceMatrix.needsUpdate = true;
+    if (pinHeadMesh.instanceColor) {
+      pinHeadMesh.instanceColor.needsUpdate = true;
     }
   };
 
@@ -1276,6 +2019,10 @@ export function createPinVisualizerScene(
     lastFrameTime = time;
 
     const audio = options.getAudioFrame?.(time) ?? fallbackAudio.getFrame(time);
+    const colorShift = options.getColorShift?.() ?? 0;
+    const solidColor = options.getSolidColorEnabled?.()
+      ? solidColorScratch.set(options.getSolidColor?.() ?? 0xffffff)
+      : null;
 
     if (audio.beat) {
       beatWaves.push({startedAt: time, strength: Math.max(0.35, audio.beatEnergy || audio.bass)});
@@ -1285,7 +2032,15 @@ export function createPinVisualizerScene(
       }
 
       if (audio.beatEnergy > 0.52) {
-        fireworks.trigger(audio.beatEnergy);
+        fireworks.trigger(audio.beatEnergy, solidColor);
+      }
+    }
+
+    if (audio.snareOnset) {
+      beatWaves.push({startedAt: time, strength: Math.max(0.18, audio.snareEnergy * 0.55)});
+
+      if (beatWaves.length > MAX_BEAT_WAVES) {
+        beatWaves.shift();
       }
     }
 
@@ -1293,14 +2048,29 @@ export function createPinVisualizerScene(
       beatWaves.shift();
     }
 
-    const glowDrive = audio.volume * 0.48 + audio.highMid * 0.24 + audio.treble * 0.28 + audio.beatEnergy * 0.45;
+    const glowDrive = audio.rmsEnergy * 0.52 + audio.highMid * 0.24 + audio.treble * 0.28 + audio.beatEnergy * 0.45;
+    const centroidGlow = audio.spectralCentroid * audio.rmsEnergy;
+    const orbitLightBands = [audio.bass, audio.lowMid, audio.mid, audio.highMid, audio.treble] as const;
 
-    renderer.toneMappingExposure = 0.96 + audio.volume * 0.18 + audio.beatEnergy * 0.18;
-    bloomPass.strength = 0.18 + audio.volume * 0.46 + audio.highMid * 0.22 + audio.treble * 0.12 + audio.beatEnergy * 0.3;
-    bloomPass.radius = 0.38 + audio.mid * 0.18 + audio.treble * 0.12;
-    pointLight.intensity = 2.2 + glowDrive * 5.8;
-    directionalLight.intensity = 0.88 + audio.volume * 0.56 + audio.beatEnergy * 0.38;
-    pinMaterial.emissiveIntensity = 0.02 + glowDrive * 0.22;
+    renderer.toneMappingExposure = 0.96 + audio.rmsEnergy * 0.22 + audio.beatEnergy * 0.18 + centroidGlow * 0.12;
+    pointLight.intensity = 2.2 + glowDrive * 5.8 + centroidGlow * 2.4;
+    directionalLight.intensity = 0.88 + audio.rmsEnergy * 0.6 + audio.beatEnergy * 0.38;
+    pinMaterial.emissiveIntensity = 0.02 + glowDrive * 0.22 + centroidGlow * 0.14;
+
+    orbitLights.forEach((light, index) => {
+      const bandEnergy = orbitLightBands[index % orbitLightBands.length];
+      const phase = time * (0.00028 + index * 0.000025) + (index / orbitLights.length) * Math.PI * 2;
+      const verticalPhase = time * (0.00021 + index * 0.000019) + index * 1.3;
+
+      light.position.set(
+        Math.cos(phase) * ORBIT_LIGHT_DISTANCE,
+        Math.sin(verticalPhase) * ORBIT_LIGHT_HEIGHT,
+        Math.sin(phase) * ORBIT_LIGHT_DISTANCE,
+      );
+      setGradientColor(light.color, index / orbitLights.length, colorShift, solidColor);
+      light.intensity = 1.15 + audio.volume * 2.8 + bandEnergy * 5.8 + audio.beatEnergy * 3.6;
+    });
+
     waveWarpPass.uniforms.time.value = time / 1000;
     waveWarpPass.uniforms.strength.value =
       0.0022 + audio.volume * 0.011 + audio.bass * 0.007 + audio.beatEnergy * 0.012;
@@ -1308,22 +2078,48 @@ export function createPinVisualizerScene(
     waveWarpPass.uniforms.mid.value = audio.mid;
     waveWarpPass.uniforms.treble.value = audio.treble;
     waveWarpPass.uniforms.beat.value = audio.beatEnergy;
-    rgbShiftPass.uniforms.amount.value = 0.004 + audio.treble * 0.014 + audio.highMid * 0.004 + audio.beatEnergy * 0.007;
+    rgbShiftPass.uniforms.amount.value = 0.004 + audio.treble * 0.014 + audio.highMid * 0.004 + audio.beatEnergy * 0.007 + audio.hatEnergy * 0.006;
     afterimagePass.uniforms.damp.value = 0.91 + clamp01(audio.lowMid + audio.mid) * 0.035;
 
-    updatePins(time, audio);
-    plasmaGlow.update(time, audio);
-    waveRibbons.update(time, audio);
-    // reactiveShapes.update(time, audio);
-    // proceduralElements.update(time, audio);
+     updatePins(time, audio, colorShift, solidColor);
+     waveRibbons.update(time, audio, colorShift, solidColor);
+    reactiveShapes?.update(time, audio);
+    proceduralElements?.update(time, audio);
     fireworks.update(deltaSeconds);
 
-    camera.position.set(
-      Math.sin(time * 0.00018) * audio.lowMid * 2.4,
-      Math.cos(time * 0.00015) * audio.mid * 1.4,
-      60 - audio.beatEnergy * 1.8,
-    );
-    camera.lookAt(0, 0, 0);
+    const isWall = (options.getShape?.() ?? 'sphere') === 'wall';
+    const activeCameraBaseZ = isWall ? wallCameraBaseZ : cameraBaseZ;
+    const activeCameraTargetY = isWall ? wallCameraTargetY : cameraTargetY;
+    const cameraDistance = getCameraDistance(activeCameraBaseZ, options.getZoom?.() ?? 1);
+    sceneFog.density = Math.min(MAX_FOG_DENSITY, 1.22 / cameraDistance);
+
+    const orbitEnabled = options.getOrbitEnabled?.() ?? false;
+    const autoOrbitYaw = (!isWall && orbitEnabled) ? time * 0.0003 : 0;
+    const autoOrbitPitch = (!isWall && orbitEnabled) ? Math.sin(time * 0.00012) * 0.22 : 0;
+    const cameraYaw = autoOrbitYaw + manualOrbitYaw;
+    const cameraPitch = THREE.MathUtils.clamp(autoOrbitPitch + manualOrbitPitch, -1.18, 1.18);
+    const effectiveDistance = Math.max(12, cameraDistance - audio.beatEnergy * 2.4);
+
+    if (isWall) {
+      camera.position.set(
+        Math.sin(cameraYaw) * effectiveDistance * 0.08 + Math.sin(time * 0.00018) * audio.lowMid * 1.2,
+        Math.sin(cameraPitch) * effectiveDistance * 0.08 + Math.cos(time * 0.00015) * audio.mid * 0.8,
+        effectiveDistance,
+      );
+      pinGroup.rotation.y = 0;
+      pinGroup.rotation.x = 0;
+    } else {
+      const horizontalDistance = Math.cos(cameraPitch) * effectiveDistance;
+      camera.position.set(
+        Math.sin(cameraYaw) * horizontalDistance + Math.sin(time * 0.00018) * audio.lowMid * 2.4,
+        Math.sin(cameraPitch) * effectiveDistance + Math.cos(time * 0.00015) * audio.mid * 1.4,
+        Math.cos(cameraYaw) * horizontalDistance,
+      );
+      pinGroup.rotation.y = time * 0.00007 + audio.lowMid * 0.12;
+      pinGroup.rotation.x = Math.sin(time * 0.00011) * 0.08 + audio.highMid * 0.05;
+    }
+
+    camera.lookAt(0, activeCameraTargetY, 0);
     composer.render();
   };
 
@@ -1334,23 +2130,30 @@ export function createPinVisualizerScene(
       isDisposed = true;
       window.cancelAnimationFrame(animationId);
       window.removeEventListener('resize', resize);
+      renderer.domElement.removeEventListener('pointerdown', handlePointerDown);
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', endPointerOrbit);
+      window.removeEventListener('pointercancel', endPointerOrbit);
       resizeObserver.disconnect();
 
-      scene.remove(pinMesh);
-      fireworks.dispose();
-      plasmaGlow.dispose();
-      waveRibbons.dispose();
-      // reactiveShapes.dispose();
-      // proceduralElements.dispose();
+      scene.remove(pinGroup);
+      for (const light of orbitLights) {
+        scene.remove(light);
+      }
+       fireworks.dispose();
+       waveRibbons.dispose();
+      reactiveShapes?.dispose();
+      proceduralElements?.dispose();
       fallbackAudio.dispose();
       renderPass.dispose();
       waveWarpPass.dispose();
-      bloomPass.dispose();
       rgbShiftPass.dispose();
       afterimagePass.dispose();
       composer.dispose();
       pinGeometry.dispose();
+      pinHeadGeometry.dispose();
       pinMaterial.dispose();
+      pinHeadMaterial.dispose();
       renderer.renderLists.dispose();
       renderer.dispose();
 
