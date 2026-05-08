@@ -1,18 +1,13 @@
 # 3D Pin Art Audio Visualizer
 
-<<<<<<< HEAD
 A real-time audio visualizer featuring a reactive 3D pin art lattice built with React, Three.js, and the Web Audio API. The visualizer transforms audio into dynamic 3D shapes with fluid animations, particle effects, and intelligent auto-mode ("God Mode") that adapts to music characteristics.
-=======
-**[Live Demo](https://pin-art-visualizer-v1-1-demo.netlify.app/)**
 
-A real-time audio visualizer rendered as a colorful reactive 3D pin art 
-lattice, built with React and Three.js.
->>>>>>> c150e3e9267c228a00fe1639c4b1e0b737f8bbbb
+**[Live Demo](https://pin-art-visualizer-v2-0-demo.netlify.app/)**
+
 
 > 🤖 This project was coded with extensive assistance from AI language models (AI slop). Some code may exhibit LLM-isms, dead code, magic numbers, or unnecessary complexity. Proceed accordingly.
 
-https://github.com/user-attachments/assets/99d0ed01-2b53-484f-a465-1a2d98079c3b
-
+<img width="771" height="655" alt="sphere" src="https://github.com/user-attachments/assets/2f676135-61c5-4156-8b8f-272247328008" />
 
 ## Features
 
@@ -166,8 +161,4 @@ All source files can use the `@/` import alias (configured in `vite.config.ts` a
 ## License
 
 MIT
-=======
-npm run typecheck
-npm run build
-```
->>>>>>> c150e3e9267c228a00fe1639c4b1e0b737f8bbbb
+
